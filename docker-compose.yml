@@ -1,9 +1,22 @@
+# 两个服务进程共享同一 SQLite 库文件（./data/cadastre.db），
+# 用于演示多窗口/多进程竞争首批建档：仅一批导入生效，落败方收到 409。
 services:
-  cadastre:
+  cadastre-a:
     build: .
-    container_name: cadastre-web
+    container_name: cadastre-a
     ports:
-      - "8000:8000"
+      - "8001:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      CADASTRE_DB: /data/cadastre.db
+    restart: unless-stopped
+
+  cadastre-b:
+    build: .
+    container_name: cadastre-b
+    ports:
+      - "8002:8000"
     volumes:
       - ./data:/data
     environment:

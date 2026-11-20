@@ -1,13 +1,22 @@
 """SQLite 持久层：现势宗地、历史版本与变更记录。
 
-并发控制：每次提交必须携带 base_version，写入时在 IMMEDIATE 事务内
-复核当前版本；版本不一致即拒绝并整体回滚，保证同一版上的两笔提交
-最多一笔生效，且任何失败都不改动现势与历史数据。
+并发控制：
+- 初始导入：几何校验不持锁（慢批次不阻塞其他窗口），写事务
+  （BEGIN IMMEDIATE）内复核库仍为空才落库——共享同一库文件的进程
+  仅一批首批导入生效，落败方整体回滚、不占用首版。
+- 分合变更：每次提交必须携带 base_version，写入时在 IMMEDIATE 事务内
+  复核当前版本；版本不一致即拒绝并整体回滚，保证同一版上的两笔提交
+  最多一笔生效，且任何失败都不改动现势与历史数据。
+
+旧库治理：若库中遗留多笔初始导入流水（旧版竞态后遗症），
+import_conflicts 返回冲突流水号；现势/宗地历史/版本快照查询与分合登记
+抛出 ImportConflictError 暂停使用，原始流水仍可查询，待档案员核对处置。
 """
 from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -64,12 +73,43 @@ class VersionConflictError(Exception):
     """base_version 与当前版本不一致（竞争提交的失败者）。"""
 
 
+class ImportConflictError(Exception):
+    """旧库遗留多笔初始导入流水：档案不可信，需档案员核对后再用。"""
+
+    def __init__(self, txn_ids: list[int]):
+        self.txn_ids = list(txn_ids)
+        ids = "、".join(f"#{i}" for i in self.txn_ids)
+        super().__init__(
+            f"库中存在 {len(self.txn_ids)} 笔初始导入流水（{ids}），"
+            "现势与历史不可信：已暂停现势/宗地历史/版本快照查询及分合登记，"
+            "原始流水仍可查询，请档案员核对处置"
+        )
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
+    _enable_wal(conn)
     return conn
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """尽量启用 WAL：多进程共享库文件时读不被写阻塞。
+
+    切换日志模式需短暂独占锁，SQLite 对该路径不走 busy 等待，并发首连
+    可能立即报 database is locked——退避重试；最终仍失败则保持回滚日志
+    模式（正确性不依赖 WAL，busy_timeout 仍保证写锁等待）。
+    """
+    for _ in range(20):
+        try:
+            row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if row and str(row[0]).lower() == "wal":
+                return
+        except sqlite3.OperationalError:
+            pass
+        time.sleep(0.1)
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -80,6 +120,26 @@ def init_db(conn: sqlite3.Connection) -> None:
 def current_version(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT value FROM meta WHERE key = 'current_version'").fetchone()
     return int(row["value"]) if row else 0
+
+
+def import_conflicts(conn: sqlite3.Connection) -> list[int]:
+    """初始导入流水超过一笔时返回全部导入流水号（旧库竞态后遗症），否则空列表。"""
+    rows = conn.execute(
+        "SELECT txn_id FROM txns WHERE kind = 'import' ORDER BY txn_id"
+    ).fetchall()
+    ids = [r["txn_id"] for r in rows]
+    return ids if len(ids) > 1 else []
+
+
+def _assert_no_import_conflict(conn: sqlite3.Connection) -> None:
+    conflicts = import_conflicts(conn)
+    if conflicts:
+        raise ImportConflictError(conflicts)
+
+
+def _has_any_parcel(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("SELECT 1 FROM parcel_versions LIMIT 1").fetchone()
+    return row is not None
 
 
 def _now() -> str:
@@ -100,6 +160,7 @@ def _parcel_to_geojson(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def list_current(conn: sqlite3.Connection) -> list[dict]:
+    _assert_no_import_conflict(conn)
     rows = conn.execute(
         """
         SELECT pv.* FROM parcel_versions pv
@@ -127,6 +188,7 @@ def _current_geoms(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def parcel_history(conn: sqlite3.Connection, parcel_id: str) -> dict:
+    _assert_no_import_conflict(conn)
     rows = conn.execute(
         "SELECT * FROM parcel_versions WHERE parcel_id = ? ORDER BY version",
         (parcel_id,),
@@ -141,6 +203,7 @@ def parcel_history(conn: sqlite3.Connection, parcel_id: str) -> dict:
 
 def snapshot_at(conn: sqlite3.Connection, version: int) -> list[dict]:
     """截至某版本的现势快照：每宗地取 <= version 的最新行，排除当时已退休者。"""
+    _assert_no_import_conflict(conn)
     rows = conn.execute(
         """
         SELECT pv.* FROM parcel_versions pv
@@ -188,8 +251,15 @@ def get_txn(conn: sqlite3.Connection, txn_id: int) -> dict:
 
 
 def import_initial(conn: sqlite3.Connection, payload: Any) -> dict:
-    """初始导入：要求库内尚无现势宗地，整批校验通过才写入。"""
-    if current_version(conn) != 0 or _current_geoms(conn):
+    """初始导入：整批校验通过才写入；写事务内复核空库，多进程仅一批胜出。
+
+    几何校验不持锁：先提交的批次还在校验时，另一批合格数据可以先完成
+    建档。真正的判定在 BEGIN IMMEDIATE 写事务内——持写锁期间库必须仍为
+    空，竞争落败方在此被拦截并整体回滚，不写入任何首版数据。
+    """
+    _assert_no_import_conflict(conn)
+    # 快速预检（仅为常见重复导入少走校验；权威复核在写事务内）
+    if current_version(conn) != 0 or _has_any_parcel(conn):
         raise VersionConflictError("数据库已存在现势宗地，不能重复初始导入")
 
     parsed = parse_feature_collection(payload)
@@ -204,6 +274,12 @@ def import_initial(conn: sqlite3.Connection, payload: Any) -> dict:
 
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # 权威复核：另一进程的胜出批次（含其后的分合）在此可见
+        if current_version(conn) != 0 or _has_any_parcel(conn):
+            raise VersionConflictError(
+                "数据库已完成初始建档（另一窗口的首批导入已生效），"
+                "本次导入未写入任何数据，请刷新现势数据"
+            )
         cur = conn.execute(
             "INSERT INTO txns (kind, base_version, new_version, reason, report_json, created_at) "
             "VALUES ('import', 0, 1, ?, NULL, ?)",
@@ -221,8 +297,9 @@ def import_initial(conn: sqlite3.Connection, payload: Any) -> dict:
                 "VALUES (?, 'new', ?, ?, ?)",
                 (txn_id, pid, geom.wkt, geom.area),
             )
+        # 库为空已复核，首版只能建立一次；不用 REPLACE，异常即整体回滚
         conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('current_version', '1')"
+            "INSERT INTO meta (key, value) VALUES ('current_version', '1')"
         )
         conn.commit()
     except Exception:
@@ -265,6 +342,7 @@ def _parse_change_request(req: dict) -> tuple[list[str], list[tuple[str, Any]]]:
 
 def plan(conn: sqlite3.Connection, req: dict) -> dict:
     """预核验：不落库，返回缺口/侵占/越界/重叠明细供网页预览。"""
+    _assert_no_import_conflict(conn)
     retired_ids, new_items = _parse_change_request(req)
     current = _current_geoms(conn)
 
@@ -290,6 +368,7 @@ def plan(conn: sqlite3.Connection, req: dict) -> dict:
 
 def commit_change(conn: sqlite3.Connection, req: dict) -> dict:
     """确认提交：版本检查 + 事务内复核 + 原子写入。"""
+    _assert_no_import_conflict(conn)
     base_version = req.get("base_version")
     if not isinstance(base_version, int) or isinstance(base_version, bool):
         raise GeoValidationError("base_version 必须是整数")

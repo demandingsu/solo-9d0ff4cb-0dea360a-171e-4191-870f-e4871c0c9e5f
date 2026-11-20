@@ -17,9 +17,15 @@ DB_PATH = os.environ.get("CADASTRE_DB", "/data/cadastre.db")
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
+def _db_path() -> str:
+    # 每次请求读取，便于测试与多实例切换库文件
+    return os.environ.get("CADASTRE_DB", DB_PATH)
+
+
 def get_conn() -> db.sqlite3.Connection:
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = db.connect(DB_PATH)
+    path = _db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = db.connect(path)
     db.init_db(conn)
     return conn
 
@@ -47,6 +53,34 @@ def _plan_error_handler(_: Request, exc: PlanValidationError) -> JSONResponse:
 @app.exception_handler(db.VersionConflictError)
 def _conflict_handler(_: Request, exc: db.VersionConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"error": "版本冲突", "detail": str(exc)})
+
+
+@app.exception_handler(db.ImportConflictError)
+def _import_conflict_handler(_: Request, exc: db.ImportConflictError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": "档案冲突待核对",
+            "detail": str(exc),
+            "conflict_txn_ids": exc.txn_ids,
+        },
+    )
+
+
+@app.get("/api/status")
+def status() -> dict:
+    """档案健康状态：empty（空库）/ ok（正常）/ conflict（多笔初始导入待核对）。"""
+    conn = get_conn()
+    try:
+        conflicts = db.import_conflicts(conn)
+        version = db.current_version(conn)
+        return {
+            "status": "conflict" if conflicts else ("ok" if version else "empty"),
+            "current_version": version,
+            "conflict_txn_ids": conflicts,
+        }
+    finally:
+        conn.close()
 
 
 @app.get("/api/state")

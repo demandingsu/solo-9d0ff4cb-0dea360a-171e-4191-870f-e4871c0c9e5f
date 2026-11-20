@@ -53,6 +53,7 @@
 </header>
 <div class="wrap">
   <div class="panel">
+    <div id="conflictBanner" class="msg err hidden" style="margin:0 0 10px"></div>
     <div class="tabs">
       <button id="tabImport" class="active" onclick="showTab('import')">导入</button>
       <button id="tabChange" onclick="showTab('change')">变更</button>
@@ -64,7 +65,7 @@
       <h2>初始导入 GeoJSON 宗地</h2>
       <p class="muted">FeatureCollection，properties.parcel_id 为宗地号；Polygon 须为整数坐标、无洞、彼此不重叠（共边允许）。</p>
       <textarea id="importText" placeholder='{"type":"FeatureCollection","features":[...]}'></textarea>
-      <button class="action" onclick="doImport()">导入并建立现势库</button>
+      <button class="action" id="importBtn" onclick="doImport()">导入并建立现势库</button>
       <div id="importMsg"></div>
     </section>
 
@@ -78,7 +79,7 @@
       <label style="margin-top:8px">变更原因（可选）</label>
       <input type="text" id="reasonText">
       <p class="muted" id="baseVerHint"></p>
-      <button class="action" onclick="doPlan()">预核验并预览缺口 / 侵占</button>
+      <button class="action" id="planBtn" onclick="doPlan()">预核验并预览缺口 / 侵占</button>
       <div id="planMsg"></div>
       <div id="planSummary"></div>
       <button class="action ok hidden" id="commitBtn" onclick="doCommit()">确认提交（原子写入）</button>
@@ -89,14 +90,14 @@
       <h2>宗地历史边界</h2>
       <div class="row">
         <input type="text" id="histParcelId" placeholder="宗地号，如 P1">
-        <button class="action" style="width:110px" onclick="queryParcelHistory()">查询</button>
+        <button class="action" id="histBtn" style="width:110px" onclick="queryParcelHistory()">查询</button>
       </div>
       <div id="histMsg"></div>
 
       <h2>历史版本快照</h2>
       <div class="row">
         <input type="number" id="snapVersion" min="1" placeholder="版本号">
-        <button class="action" style="width:110px" onclick="querySnapshot()">查询</button>
+        <button class="action" id="snapBtn" style="width:110px" onclick="querySnapshot()">查询</button>
       </div>
       <div id="snapMsg"></div>
 
@@ -125,6 +126,8 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
 let state = { version: 0, parcels: [] };
 let lastPlan = null;
+let archiveConflict = null;  // 非空即冲突流水号数组：档案待核对，查询与登记暂停
+let mapHint = "";
 
 function showTab(name) {
   for (const t of ["Import", "Change", "Query"]) {
@@ -142,11 +145,48 @@ function setMsg(id, cls, text) {
 async function api(path, opts) {
   const resp = await fetch(path, opts);
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error((data.error || "请求失败") + "：" + (data.detail || resp.status));
+  if (!resp.ok) {
+    const err = new Error((data.error || "请求失败") + "：" + (data.detail || resp.status));
+    err.status = resp.status;
+    err.body = data;
+    throw err;
+  }
   return data;
 }
 
+function renderConflictBanner() {
+  const paused = !!archiveConflict;
+  const banner = document.getElementById("conflictBanner");
+  banner.classList.toggle("hidden", !paused);
+  if (paused) {
+    banner.innerHTML = "⚠ <b>档案冲突待核对：</b>库中存在多笔初始导入，冲突流水号 " +
+      archiveConflict.map(id => `<span class="txn-link" onclick="showTab('query');loadTxn(${id})">#${id}</span>`).join("、") +
+      "。<br>现势、宗地历史、版本快照查询及分合登记已暂停；原始流水仍可查询（见「查询」页），请档案员核对处置。";
+  }
+  for (const id of ["importBtn", "planBtn", "commitBtn", "histBtn", "snapBtn"]) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = paused;
+  }
+}
+
 async function refreshState() {
+  const st = await api("/api/status");
+  if (st.status === "conflict") {
+    archiveConflict = st.conflict_txn_ids;
+    mapHint = "档案冲突待核对：现势查询已暂停，请核对冲突流水";
+    document.getElementById("versionLabel").textContent = "档案冲突待核对（流水 " +
+      st.conflict_txn_ids.map(i => "#" + i).join("、") + "）";
+    document.getElementById("baseVerHint").textContent = "";
+    state = { current_version: st.current_version, parcels: [] };
+    renderConflictBanner();
+    renderMap();
+    showTab("query");
+    loadTxns();
+    return;
+  }
+  archiveConflict = null;
+  mapHint = "";
+  renderConflictBanner();
   const data = await api("/api/state");
   state = data;
   document.getElementById("versionLabel").textContent = "当前版本：v" + data.current_version + "　宗地数：" + data.parcel_count;
@@ -175,7 +215,7 @@ function renderMap(overlays) {
   if (!rings.length) {
     const t = document.createElementNS(SVG_NS, "text");
     t.setAttribute("x", 20); t.setAttribute("y", 30); t.setAttribute("fill", "#7b8794");
-    t.textContent = "暂无数据，请先导入 GeoJSON 宗地";
+    t.textContent = mapHint || "暂无数据，请先导入 GeoJSON 宗地";
     svg.appendChild(t);
     return;
   }
@@ -239,7 +279,15 @@ async function doImport() {
     const r = await api("/api/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     setMsg("importMsg", "ok", `导入成功：${r.imported} 宗，版本 v${r.new_version}，流水号 #${r.txn_id}`);
     await refreshState();
-  } catch (e) { setMsg("importMsg", "err", e.message); }
+  } catch (e) {
+    if (e.status === 409) {
+      // 竞争落败 / 重复导入：库已建档。输入不清空，刷新为库中现势供核对。
+      setMsg("importMsg", "warn", e.message + "\n你的输入已保留在上方文本框中；已刷新为库中现势数据，可核对后处理。");
+      await refreshState().catch(() => {});
+    } else {
+      setMsg("importMsg", "err", e.message);
+    }
+  }
 }
 
 /* ---------- 变更 ---------- */
